@@ -57,17 +57,23 @@ function toParagraphs(text) {
   return text.split(/\n{2,}/).map(p => p.replace(/\s+/g, " ").trim()).filter(p => p.length > 30);
 }
 
-// ── Edge TTS via /api/tts ─────────────────────────────────────────────────
+// ── Edge TTS via Cloudflare Worker ───────────────────────────────────────
 const audioCache = {};
+const WORKER_KEY = "tts_worker_url";
+const getWorkerUrl = () => (localStorage.getItem(WORKER_KEY) || "").replace(/\/$/, "");
+const saveWorkerUrl = url => localStorage.setItem(WORKER_KEY, url.trim());
 
 async function fetchTTS(text, voice) {
+  const workerUrl = getWorkerUrl();
+  if (!workerUrl) throw new Error("Configure a URL do Cloudflare Worker primeiro!");
+
   const key = `${voice}::${text.slice(0, 60)}`;
   if (audioCache[key]) return audioCache[key];
 
-  const res = await fetch("/api/tts", {
+  const res = await fetch(workerUrl + "/v1/audio/speech", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: text.slice(0, 3000), voice }),
+    body: JSON.stringify({ input: text.slice(0, 2800), voice, model: "tts-1" }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -177,6 +183,9 @@ export default function App() {
   const [speed, setSpeed] = useState(1);
   const [voice, setVoice] = useState(getSavedVoice);
   const [statusMsg, setStatusMsg] = useState("");
+  const [workerUrl, setWorkerUrl] = useState(() => localStorage.getItem("tts_worker_url") || "");
+  const [workerInput, setWorkerInput] = useState("");
+  const [workerSet, setWorkerSet] = useState(() => !!localStorage.getItem("tts_worker_url"));
 
   const audioRef = useRef(null);
   const parasRef = useRef([]);
@@ -319,6 +328,34 @@ export default function App() {
           </div>
 
           {errMsg && <div style={{ background: "#f8714922", border: "1px solid #f8714966", borderRadius: 10, padding: "12px 16px", color: C.red, fontSize: 14, marginBottom: 16 }}>⚠️ {errMsg}</div>}
+
+          {/* Worker setup */}
+          {!workerSet ? (
+            <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14, padding: 18, marginBottom: 20 }}>
+              <div style={{ fontWeight: 700, marginBottom: 6, color: C.acc2, fontSize: 15 }}>🎙️ Configurar Voz Microsoft Neural</div>
+              <div style={{ color: C.muted, fontSize: 13, marginBottom: 12, lineHeight: 1.6 }}>
+                Cole abaixo a URL do seu Cloudflare Worker (ver passo a passo acima).
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <input type="text" placeholder="https://meu-worker.workers.dev"
+                  value={workerInput} onChange={e => setWorkerInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && workerInput.trim()) { const u = workerInput.trim(); saveWorkerUrl(u); setWorkerUrl(u); setWorkerSet(true); }}}
+                  style={{ background: C.s2, border: `1px solid ${C.border}`, color: C.text, padding: "9px 14px", borderRadius: 8, fontSize: 13, fontFamily: "inherit", flex: 1, outline: "none" }} />
+                <button style={{ background: C.acc, color: C.bg, border: "none", borderRadius: 8, padding: "10px 20px", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}
+                  onClick={() => { if (!workerInput.trim()) return; const u = workerInput.trim(); saveWorkerUrl(u); setWorkerUrl(u); setWorkerSet(true); }}>Salvar</button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ background: C.s1, border: `1px solid ${C.border}`, borderRadius: 14, padding: "12px 16px", marginBottom: 20, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13, color: C.green }}>✓ Voz Microsoft Neural ativa</span>
+              <select style={{ background: C.s2, border: `1px solid ${C.border}`, color: C.text, padding: "6px 10px", borderRadius: 8, fontSize: 12, fontFamily: "inherit", flex: 1, maxWidth: 260 }}
+                value={voice} onChange={e => { setVoice(e.target.value); saveVoice(e.target.value); }}>
+                {VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
+              </select>
+              <button style={{ background: "none", border: `1px solid ${C.border}`, color: C.muted, padding: "5px 12px", borderRadius: 8, fontSize: 12, cursor: "pointer", fontFamily: "inherit" }}
+                onClick={() => { localStorage.removeItem("tts_worker_url"); setWorkerSet(false); setWorkerInput(""); setWorkerUrl(""); }}>Trocar URL</button>
+            </div>
+          )}
 
           <label style={{ display: "block", border: `2px dashed ${C.border}`, borderRadius: 14, padding: "28px 20px", textAlign: "center", cursor: "pointer", background: C.s1, marginBottom: 32, position: "relative" }}>
             <div style={{ fontSize: 36, marginBottom: 8 }}>➕</div>
