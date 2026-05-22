@@ -1,18 +1,19 @@
-// api/tts.js — sem dependências externas, chama Microsoft Edge TTS direto
-import { randomUUID } from "crypto";
-import { createRequire } from "module";
-
+// api/tts.js — usa fetch HTTP direto, sem WebSocket, sem pacotes externos
 export const config = { maxDuration: 30 };
 
-// Gera o XML de configuração que o Edge TTS espera
+const VOICES = [
+  "pt-BR-ThalitaNeural","pt-BR-FranciscaNeural","pt-BR-BrendaNeural",
+  "pt-BR-GiovannaNeural","pt-BR-AntonioNeural","pt-BR-DonatoNeural",
+  "pt-BR-FabioNeural","pt-BR-HumbertoNeural","pt-BR-JulioNeural"
+];
+
 function buildSSML(text, voice) {
-  const escaped = text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
+  const safe = text
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
     .slice(0, 2800);
-  return `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='pt-BR'>` +
-    `<voice name='${voice}'>${escaped}</voice></speak>`;
+  return `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' `+
+    `xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='pt-BR'>`+
+    `<voice name='${voice}'>${safe}</voice></speak>`;
 }
 
 export default async function handler(req, res) {
@@ -25,82 +26,76 @@ export default async function handler(req, res) {
   const { text, voice = "pt-BR-ThalitaNeural" } = req.body || {};
   if (!text) { res.status(400).json({ error: "Texto obrigatório" }); return; }
 
-  const requestId = randomUUID().replace(/-/g, "");
-  const timestamp = new Date().toISOString().replace(/[:-]/g, "").replace(".", "").slice(0, 15) + "Z";
-
-  const wsUrl = `wss://eastus.tts.speech.microsoft.com/cognitiveservices/websocket/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId=${requestId}`;
+  const safeVoice = VOICES.includes(voice) ? voice : "pt-BR-ThalitaNeural";
 
   try {
-    // Dynamically import ws (available in Node.js on Vercel)
-    let WebSocket;
-    try {
-      const { WebSocket: WS } = await import("ws");
-      WebSocket = WS;
-    } catch {
-      // fallback to global
-      WebSocket = globalThis.WebSocket;
+    // Passo 1: pegar token de autenticação gratuito do Edge
+    const tokenRes = await fetch(
+      "https://eastus.api.speech.microsoft.com/sts/v1.0/issueToken",
+      {
+        method: "POST",
+        headers: {
+          "Ocp-Apim-Subscription-Key": "6A5AA1D4EAFF4E9FB37E23D68491D6F4",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+      }
+    );
+
+    let token = null;
+    if (tokenRes.ok) {
+      token = await tokenRes.text();
     }
 
-    await new Promise((resolve, reject) => {
-      const ws = new WebSocket(wsUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          "Origin": "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
-        },
-      });
+    // Passo 2: chamar TTS com token ou chave direta
+    const ttsHeaders = {
+      "Content-Type": "application/ssml+xml",
+      "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+      "User-Agent": "LeitorPDF",
+    };
 
-      const audioChunks = [];
-      let headersDone = false;
+    if (token) {
+      ttsHeaders["Authorization"] = `Bearer ${token}`;
+    } else {
+      ttsHeaders["Ocp-Apim-Subscription-Key"] = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+    }
 
-      ws.binaryType = "arraybuffer";
+    const ttsRes = await fetch(
+      "https://eastus.tts.speech.microsoft.com/cognitiveservices/v1",
+      {
+        method: "POST",
+        headers: ttsHeaders,
+        body: buildSSML(text, safeVoice),
+      }
+    );
 
-      ws.on("open", () => {
-        // Send speech config
-        ws.send(
-          `X-Timestamp:${timestamp}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
-          JSON.stringify({ context: { synthesis: { audio: { metadataoptions: { sentenceBoundaryEnabled: false, wordBoundaryEnabled: false }, outputFormat: "audio-24khz-48kbitrate-mono-mp3" } } } })
-        );
-
-        // Send SSML
-        const ssml = buildSSML(text, voice);
-        ws.send(
-          `X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${timestamp}\r\nPath:ssml\r\n\r\n${ssml}`
-        );
-      });
-
-      ws.on("message", (data) => {
-        if (typeof data === "string") {
-          if (data.includes("Path:turn.end")) {
-            ws.close();
-          }
-        } else {
-          // Binary: find audio header separator
-          const buf = Buffer.from(data);
-          if (!headersDone) {
-            const separator = buf.indexOf(Buffer.from("Path:audio\r\n"));
-            if (separator !== -1) {
-              headersDone = true;
-              audioChunks.push(buf.slice(separator + "Path:audio\r\n".length + 2));
-            }
-          } else {
-            audioChunks.push(buf);
-          }
+    if (!ttsRes.ok) {
+      // fallback: tenta região diferente
+      const ttsRes2 = await fetch(
+        "https://westus.tts.speech.microsoft.com/cognitiveservices/v1",
+        {
+          method: "POST",
+          headers: {
+            ...ttsHeaders,
+            "Ocp-Apim-Subscription-Key": "6A5AA1D4EAFF4E9FB37E23D68491D6F4",
+          },
+          body: buildSSML(text, safeVoice),
         }
-      });
+      );
+      if (!ttsRes2.ok) {
+        const errText = await ttsRes2.text().catch(() => "");
+        throw new Error(`TTS falhou: ${ttsRes2.status} — ${errText.slice(0,200)}`);
+      }
+      const buf2 = Buffer.from(await ttsRes2.arrayBuffer());
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      return res.status(200).send(buf2);
+    }
 
-      ws.on("close", () => {
-        if (!audioChunks.length) { reject(new Error("Nenhum áudio recebido")); return; }
-        const audio = Buffer.concat(audioChunks);
-        res.setHeader("Content-Type", "audio/mpeg");
-        res.setHeader("Cache-Control", "public, max-age=3600");
-        res.status(200).send(audio);
-        resolve();
-      });
+    const buf = Buffer.from(await ttsRes.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    return res.status(200).send(buf);
 
-      ws.on("error", reject);
-
-      setTimeout(() => { ws.close(); reject(new Error("Timeout")); }, 25000);
-    });
   } catch (err) {
     console.error("TTS error:", err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message });
