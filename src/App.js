@@ -108,21 +108,33 @@ function toParagraphs(text) {
   return text.split(/\n{2,}/).map(p => p.replace(/\s+/g, " ").trim()).filter(p => p.length > 30);
 }
 
-// ── Web Speech API TTS ────────────────────────────────────────────────────
-function getVoices() {
-  return new Promise(resolve => {
-    const list = speechSynthesis.getVoices();
-    if (list.length) { resolve(list); return; }
-    speechSynthesis.onvoiceschanged = () => resolve(speechSynthesis.getVoices());
-  });
-}
+// ── Cloudflare Worker TTS (vozes Edge da Microsoft) ───────────────────────
+const TTS_WORKER = "https://meu-tts.madsembora.workers.dev/v1/audio/speech";
 
-async function loadVoiceList() {
-  const all = await getVoices();
-  // Prefere vozes pt-BR, depois pt, depois qualquer uma
-  const ptBR = all.filter(v => v.lang === "pt-BR");
-  const pt   = all.filter(v => v.lang.startsWith("pt") && v.lang !== "pt-BR");
-  return ptBR.length ? ptBR : pt.length ? pt : all;
+const EDGE_VOICES = [
+  { id: "pt-BR-ThalitaNeural",   label: "Thalita — natural e suave 🌸" },
+  { id: "pt-BR-FranciscaNeural", label: "Francisca — mais séria 💼" },
+  { id: "pt-BR-BrendaNeural",    label: "Brenda — moderna 🎧" },
+  { id: "pt-BR-GiovannaNeural",  label: "Giovanna — limpa e clara ✨" },
+  { id: "pt-BR-AntonioNeural",   label: "Antônio — masculina 🎙️" },
+  { id: "pt-BR-DonatoNeural",    label: "Donato — masculina grave 🔊" },
+  { id: "pt-BR-FabioNeural",     label: "Fábio — masculina 🎤" },
+  { id: "pt-BR-HumbertoNeural",  label: "Humberto — masculina 📢" },
+  { id: "pt-BR-JulioNeural",     label: "Júlio — masculina jovem 🎵" },
+];
+
+async function workerTTS(text, voice, speed) {
+  const res = await fetch(TTS_WORKER, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input: text.slice(0, 4000), voice, speed: String(speed) }),
+  });
+  if (!res.ok) {
+    const msg = await res.text().catch(() => res.status);
+    throw new Error("Erro TTS: " + msg);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
 }
 
 async function hashBuffer(buf) {
@@ -173,31 +185,25 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [loadingAudio, setLoadingAudio] = useState(false);
   const [speed, setSpeed] = useState(1);
-  const [voices, setVoices] = useState([]);
-  const [voiceIdx, setVoiceIdx] = useState(0);
+  const [voice, setVoice] = useState("pt-BR-ThalitaNeural");
   const [statusMsg, setStatusMsg] = useState("");
   const [dbReady, setDbReady] = useState(false);
-  const [ttsSupported, setTtsSupported] = useState(true);
 
   const parasRef = useRef([]);
   const curRef = useRef(0);
   const playingRef = useRef(false);
   const speedRef = useRef(1);
-  const voiceIdxRef = useRef(0);
+  const voiceRef = useRef("pt-BR-ThalitaNeural");
   const activeHashRef = useRef("");
   const paraEls = useRef([]);
-  const utterRef = useRef(null);
+  const audioRef = useRef(null);
+  const audioCache = useRef({});
 
   parasRef.current = paras;
   curRef.current = cur;
   playingRef.current = playing;
   speedRef.current = speed;
-  voiceIdxRef.current = voiceIdx;
-
-  useEffect(() => {
-    if (!("speechSynthesis" in window)) { setTtsSupported(false); return; }
-    loadVoiceList().then(v => setVoices(v));
-  }, []);
+  voiceRef.current = voice;
 
   useEffect(() => {
     async function init() {
@@ -219,15 +225,14 @@ export default function App() {
       artist: "Meu Leitor de PDF",
       album: "Biblioteca",
     });
-    navigator.mediaSession.setActionHandler("pause", () => { speechSynthesis.pause(); setPlaying(false); playingRef.current = false; });
-    navigator.mediaSession.setActionHandler("play",  () => { speechSynthesis.resume(); setPlaying(true); playingRef.current = true; });
+    navigator.mediaSession.setActionHandler("pause", () => { audioRef.current?.pause(); setPlaying(false); playingRef.current = false; });
+    navigator.mediaSession.setActionHandler("play",  () => { audioRef.current?.play(); setPlaying(true); playingRef.current = true; });
     navigator.mediaSession.setActionHandler("previoustrack", () => { if (curRef.current > 0) playParagraph(curRef.current - 1); });
     navigator.mediaSession.setActionHandler("nexttrack",     () => { if (curRef.current < parasRef.current.length - 1) playParagraph(curRef.current + 1); });
   }, [activeBook]);
 
   const stopAudio = useCallback(() => {
-    speechSynthesis.cancel();
-    utterRef.current = null;
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.src = ""; }
     setPlaying(false); playingRef.current = false; setLoadingAudio(false);
     if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
   }, []);
@@ -235,7 +240,7 @@ export default function App() {
   const playParagraph = useCallback(async (idx) => {
     const ps = parasRef.current;
     if (!ps.length || idx >= ps.length) return;
-    speechSynthesis.cancel();
+    stopAudio();
     setLoadingAudio(true);
     setCur(idx); curRef.current = idx;
 
@@ -248,38 +253,46 @@ export default function App() {
     }
 
     paraEls.current[idx]?.scrollIntoView({ behavior:"smooth", block:"center" });
+    setStatusMsg(`⏳ Gerando parágrafo ${idx+1} de ${ps.length}…`);
 
-    const utter = new SpeechSynthesisUtterance(ps[idx]);
-    utter.rate = speedRef.current;
-    utter.lang = "pt-BR";
-    const vList = await loadVoiceList();
-    if (vList[voiceIdxRef.current]) utter.voice = vList[voiceIdxRef.current];
-
-    utter.onstart = () => {
-      setPlaying(true); playingRef.current = true; setLoadingAudio(false);
-      setStatusMsg(`▶ Parágrafo ${idx+1} de ${ps.length}`);
-      if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
-    };
-    utter.onend = () => {
-      if (playingRef.current && idx+1 < ps.length) playParagraph(idx+1);
-      else if (idx+1 >= ps.length) {
-        setPlaying(false); playingRef.current = false;
-        setStatusMsg("Leitura concluída 🎉");
-        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+    try {
+      const cacheKey = `${activeHashRef.current}_${idx}_${voiceRef.current}_${speedRef.current}`;
+      let url = audioCache.current[cacheKey];
+      if (!url) {
+        url = await workerTTS(ps[idx], voiceRef.current, speedRef.current);
+        audioCache.current[cacheKey] = url;
       }
-    };
-    utter.onerror = e => {
-      if (e.error === "interrupted") return;
-      setPlaying(false); playingRef.current = false; setLoadingAudio(false);
-      setStatusMsg("Erro no áudio: " + e.error);
-    };
-
-    utterRef.current = utter;
-    speechSynthesis.speak(utter);
+      const audio = new Audio(url);
+      audio.preload = "auto";
+      audioRef.current = audio;
+      audio.onplay = () => {
+        setPlaying(true); playingRef.current = true; setLoadingAudio(false);
+        setStatusMsg(`▶ Parágrafo ${idx+1} de ${ps.length}`);
+        if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
+      };
+      audio.onended = () => {
+        if (playingRef.current && idx+1 < ps.length) playParagraph(idx+1);
+        else if (idx+1 >= ps.length) {
+          setPlaying(false); playingRef.current = false;
+          setStatusMsg("Leitura concluída 🎉");
+          if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
+        }
+      };
+      audio.onerror = () => {
+        setPlaying(false); playingRef.current = false; setLoadingAudio(false);
+        setStatusMsg("Erro no áudio. Verifique sua conexão.");
+      };
+      await audio.play();
+      // Pré-carrega próximo parágrafo
+      if (idx+1 < ps.length) {
+        const nk = `${activeHashRef.current}_${idx+1}_${voiceRef.current}_${speedRef.current}`;
+        if (!audioCache.current[nk]) workerTTS(ps[idx+1], voiceRef.current, speedRef.current).then(u => { audioCache.current[nk] = u; }).catch(()=>{});
+      }
+    } catch(e) { setLoadingAudio(false); setPlaying(false); setStatusMsg("Erro: " + e.message); }
   }, [stopAudio]);
 
   const openBook = useCallback(async (book) => {
-    stopAudio();
+    stopAudio(); audioCache.current = {};
     setView("loading"); setLoadMsg("Abrindo livro…"); setLoadPct(10);
     try {
       const byteStr = atob(book.b64);
@@ -335,22 +348,20 @@ export default function App() {
 
   const handlePlayPause = () => {
     if (loadingAudio) return;
-    if (playing) {
-      speechSynthesis.pause();
-      setPlaying(false); playingRef.current = false;
+    if (playing && audioRef.current) {
+      audioRef.current.pause(); setPlaying(false); playingRef.current = false;
       setStatusMsg("Pausado ⏸");
       if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
-    } else if (speechSynthesis.paused) {
-      speechSynthesis.resume();
-      setPlaying(true); playingRef.current = true;
+    } else if (!playing && audioRef.current?.src) {
+      audioRef.current.play(); setPlaying(true); playingRef.current = true;
       if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
     } else {
       playParagraph(curRef.current);
     }
   };
 
-  const changeSpeed = s => { setSpeed(s); speedRef.current = s; if (playing) { const idx=curRef.current; stopAudio(); setTimeout(()=>playParagraph(idx),80); } };
-  const changeVoice = i => { setVoiceIdx(i); voiceIdxRef.current = i; if (playing) { const idx=curRef.current; stopAudio(); setTimeout(()=>playParagraph(idx),80); } };
+  const changeSpeed = s => { setSpeed(s); speedRef.current = s; audioCache.current = {}; if (playing || audioRef.current?.src) { const idx=curRef.current; stopAudio(); setTimeout(()=>playParagraph(idx),80); } };
+  const changeVoice = v => { setVoice(v); voiceRef.current = v; audioCache.current = {}; if (playing || audioRef.current?.src) { const idx=curRef.current; stopAudio(); setTimeout(()=>playParagraph(idx),80); } };
 
   const pct = paras.length ? Math.round(((cur+1)/paras.length)*100) : 0;
   const btnLabel = loadingAudio ? "⏳ Iniciando…" : playing ? "⏸ Pausar" : "▶ Ouvir";
@@ -371,9 +382,7 @@ export default function App() {
             <div style={{ fontSize:"clamp(26px,5vw,40px)", fontWeight:800, color:C.acc2, marginBottom:4 }}>📚 Minha Biblioteca</div>
             <div style={{ color:C.muted, fontSize:13 }}>{!dbReady ? "Carregando…" : library.length===0 ? "Adicione seu primeiro livro" : `${library.length} livro${library.length!==1?"s":""} na coleção`}</div>
           </div>
-          {!ttsSupported && <div style={{ background:"#f8714922", border:"1px solid #f8714966", borderRadius:10, padding:"12px 16px", color:C.red, fontSize:14, marginBottom:16 }}>⚠️ Seu navegador não suporta síntese de voz. Use Chrome, Edge ou Safari.</div>}
-          {errMsg && <div style={{ background:"#f8714922", border:"1px solid #f8714966", borderRadius:10, padding:"12px 16px", color:C.red, fontSize:14, marginBottom:16 }}>⚠️ {errMsg}</div>}
-          <label style={{ display:"block", border:`2px dashed ${C.border}`, borderRadius:14, padding:"28px 20px", textAlign:"center", cursor:"pointer", background:C.s1, marginBottom:32, position:"relative" }}>
+          {errMsg && <div style={{ background:"#f8714922", border:"1px solid #f8714966", borderRadius:10, padding:"12px 16px", color:C.red, fontSize:14, marginBottom:16 }}>⚠️ {errMsg}</div>}          <label style={{ display:"block", border:`2px dashed ${C.border}`, borderRadius:14, padding:"28px 20px", textAlign:"center", cursor:"pointer", background:C.s1, marginBottom:32, position:"relative" }}>
             <div style={{ fontSize:36, marginBottom:8 }}>➕</div>
             <div style={{ fontWeight:700, fontSize:16, color:C.acc, marginBottom:4 }}>Adicionar livro</div>
             <div style={{ color:C.muted, fontSize:13 }}>Clique ou arraste um PDF</div>
@@ -424,15 +433,12 @@ export default function App() {
               <button style={btnP(loadingAudio?C.muted:playing?C.red:C.acc,C.bg)} disabled={loadingAudio} onClick={handlePlayPause}>{btnLabel}</button>
               <button style={{ ...btnO, opacity:cur>=paras.length-1?0.4:1 }} disabled={cur>=paras.length-1} onClick={()=>playParagraph(cur+1)}>⏭</button>
             </div>
-            {voices.length > 0 && (
-              <div style={row({ justifyContent:"center", marginBottom:12 })}>
-                <span style={{ fontSize:12, color:C.muted }}>Voz:</span>
-                <select value={voiceIdx} onChange={e=>changeVoice(Number(e.target.value))} style={{ background:C.s2, border:`1px solid ${C.border}`, color:C.text, padding:"7px 10px", borderRadius:8, fontSize:13, fontFamily:"inherit", flex:1, maxWidth:280 }}>
-                  {voices.map((v,i)=><option key={i} value={i}>{v.name} ({v.lang})</option>)}
-                </select>
-              </div>
-            )}
-            <div style={row({ justifyContent:"center" })}>
+            <div style={row({ justifyContent:"center", marginBottom:12 })}>
+              <span style={{ fontSize:12, color:C.muted }}>Voz:</span>
+              <select value={voice} onChange={e=>changeVoice(e.target.value)} style={{ background:C.s2, border:`1px solid ${C.border}`, color:C.text, padding:"7px 10px", borderRadius:8, fontSize:13, fontFamily:"inherit", flex:1, maxWidth:280 }}>
+                {EDGE_VOICES.map(v=><option key={v.id} value={v.id}>{v.label}</option>)}
+              </select>
+            </div>            <div style={row({ justifyContent:"center" })}>
               <span style={{ fontSize:12, color:C.muted }}>Velocidade:</span>
               {SPEEDS.map(s=><button key={s} style={btnT(speed===s)} onClick={()=>changeSpeed(s)}>{s}×</button>)}
             </div>
