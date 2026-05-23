@@ -1,4 +1,6 @@
-const https = require("https");
+// api/tts.js — Edge TTS via WebSocket no servidor (sem restrições do browser)
+const { WebSocket } = require("ws");
+const { randomUUID } = require("crypto");
 
 const ALLOWED_VOICES = [
   "pt-BR-ThalitaNeural","pt-BR-FranciscaNeural","pt-BR-BrendaNeural",
@@ -6,32 +8,70 @@ const ALLOWED_VOICES = [
   "pt-BR-FabioNeural","pt-BR-HumbertoNeural","pt-BR-JulioNeural",
 ];
 
-function httpsPost(hostname, path, body) {
-  return new Promise((resolve, reject) => {
-    const bodyStr = JSON.stringify(body);
-    const req = https.request({
-      hostname, path, method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(bodyStr), "User-Agent": "Mozilla/5.0" },
-    }, (res) => {
-      const chunks = [];
-      res.on("data", d => chunks.push(d));
-      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
-      res.on("error", reject);
-    });
-    req.on("error", reject);
-    req.write(bodyStr);
-    req.end();
-  });
+function buildSSML(text, voice, rateStr) {
+  const esc = text.replace(/[<>&'"]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;","'":"&apos;",'"':"&quot;"}[c]));
+  return `<speak version='1.0' xml:lang='pt-BR'><voice name='${voice}'><prosody rate='${rateStr}'>${esc}</prosody></voice></speak>`;
 }
 
-function httpsGet(url) {
+function edgeTTS(text, voice, rateStr) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
-      const chunks = [];
-      res.on("data", d => chunks.push(d));
-      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
-      res.on("error", reject);
-    }).on("error", reject);
+    const reqId = randomUUID().replace(/-/g,"").toUpperCase();
+    const timestamp = new Date().toISOString().replace(/[:-]/g,"").replace(".",":").slice(0,19) + "Z";
+    const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId=${reqId}`;
+    
+    const ws = new WebSocket(url, {
+      headers: {
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+        "Origin": "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+      }
+    });
+
+    const audioChunks = [];
+    let audioStarted = false;
+    const timeout = setTimeout(() => { ws.close(); reject(new Error("Timeout")); }, 20000);
+
+    ws.on("open", () => {
+      // Mensagem de configuração
+      ws.send(
+        `X-Timestamp:${timestamp}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
+        JSON.stringify({ context: { synthesis: { audio: { metadataoptions: { sentenceBoundaryEnabled: false, wordBoundaryEnabled: false }, outputFormat: "audio-24khz-48kbitrate-mono-mp3" } } } })
+      );
+      // Mensagem SSML
+      ws.send(
+        `X-RequestId:${reqId}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${timestamp}\r\nPath:ssml\r\n\r\n` +
+        buildSSML(text, voice, rateStr)
+      );
+    });
+
+    ws.on("message", (data, isBinary) => {
+      if (isBinary) {
+        // Áudio binário — achar onde começa o MP3 (após header "Path:audio\r\n\r\n")
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        if (!audioStarted) {
+          const header = buf.slice(0, 2).readUInt16BE(0);
+          const headerStr = buf.slice(2, 2 + header).toString();
+          if (headerStr.includes("Path:audio")) {
+            audioStarted = true;
+            audioChunks.push(buf.slice(2 + header));
+          }
+        } else {
+          audioChunks.push(buf);
+        }
+      } else {
+        const msg = data.toString();
+        if (msg.includes("Path:turn.end")) {
+          clearTimeout(timeout);
+          ws.close();
+          if (!audioChunks.length) { reject(new Error("Nenhum áudio recebido")); return; }
+          resolve(Buffer.concat(audioChunks));
+        }
+      }
+    });
+
+    ws.on("error", (err) => { clearTimeout(timeout); reject(err); });
+    ws.on("close", () => { clearTimeout(timeout); });
   });
 }
 
@@ -57,30 +97,11 @@ module.exports = async function handler(req, res) {
   const rateStr = rate >= 0 ? `+${rate}%` : `${rate}%`;
 
   try {
-    // Step 1: POST to FreeTTS to get file_id
-    const genRes = await httpsPost("freetts.org", "/api/tts", {
-      text: text.slice(0, 4000),
-      voice,
-      rate: rateStr,
-      pitch: "+0Hz",
-    });
-
-    if (genRes.status !== 200) {
-      throw new Error(`FreeTTS retornou ${genRes.status}: ${genRes.body.toString().slice(0, 200)}`);
-    }
-
-    const json = JSON.parse(genRes.body.toString());
-    if (!json.file_id) throw new Error("Sem file_id na resposta: " + JSON.stringify(json));
-
-    // Step 2: GET the MP3
-    const audioRes = await httpsGet(`https://freetts.org/api/audio/${json.file_id}`);
-    if (audioRes.status !== 200) throw new Error(`Erro ao baixar áudio: ${audioRes.status}`);
-
+    const audioBuffer = await edgeTTS(text.slice(0, 4000), voice, rateStr);
     res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Length", audioRes.body.length);
+    res.setHeader("Content-Length", audioBuffer.length);
     res.setHeader("Cache-Control", "public, max-age=3600");
-    res.status(200).end(audioRes.body);
-
+    res.status(200).end(audioBuffer);
   } catch(e) {
     console.error("TTS error:", e.message);
     res.status(500).json({ error: e.message });
