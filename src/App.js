@@ -136,34 +136,17 @@ function buildSSML(text, voice, rate = 0) {
 function rateToPercent(speed) { return Math.round((speed - 1) * 100); }
 
 async function edgeTTS(text, voice, speed = 1) {
-  const ENDPOINT = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId=" + crypto.randomUUID().replace(/-/g, "");
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(ENDPOINT);
-    const chunks = [];
-    let audioStarted = false;
-    const timeout = setTimeout(() => { ws.close(); reject(new Error("Timeout EdgeTTS")); }, 15000);
-    ws.onopen = () => {
-      ws.send(`Path: speech.config\r\nX-RequestId: ${crypto.randomUUID().replace(/-/g,"")}\r\nX-Timestamp: ${new Date().toISOString()}\r\nContent-Type: application/json\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":false,"wordBoundaryEnabled":false},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}`);
-      ws.send(`Path: ssml\r\nX-RequestId: ${crypto.randomUUID().replace(/-/g,"")}\r\nX-Timestamp: ${new Date().toISOString()}\r\nContent-Type: application/ssml+xml\r\n\r\n${buildSSML(text, voice, rateToPercent(speed))}`);
-    };
-    ws.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        if (event.data.includes("Path:turn.end")) {
-          clearTimeout(timeout); ws.close();
-          resolve(URL.createObjectURL(new Blob(chunks, { type: "audio/mpeg" })));
-        }
-      } else {
-        const arr = new Uint8Array(event.data);
-        const sep = "Path:audio\r\n";
-        for (let i = 0; i < arr.length - sep.length; i++) {
-          if (String.fromCharCode(...arr.slice(i, i + sep.length)) === sep) {
-            chunks.push(arr.slice(i + sep.length)); audioStarted = true; break;
-          }
-        }
-      }
-    };
-    ws.onerror = () => { clearTimeout(timeout); reject(new Error("Erro WebSocket")); };
+  const res = await fetch("/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: text.slice(0, 4000), voice, speed }),
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || "Erro ao gerar áudio");
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
 }
 
 async function hashBuffer(buf) {
