@@ -94,19 +94,85 @@ const EDGE_VOICES = [
   { id: "pt-BR-HumbertoNeural",  label: "Humberto — masculina 📢" },
 ];
 
-// ── TTS via API proxy ────────────────────────────────────────────────────
-async function fetchTTS(text, voice="pt-BR-ThalitaNeural", speed=1) {
-  const res = await fetch("/api/tts", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ text: text.slice(0,4000), voice, speed }),
+// ── TTS — WebSocket direto (funciona no APK nativo) ─────────────────────
+function buildSSML(text, voice, rate) {
+  const rateStr = rate >= 0 ? `+${rate}%` : `${rate}%`;
+  const esc = text.replace(/[<>&'"]/g, c =>
+    ({"<":"&lt;",">":"&gt;","&":"&amp;","'":"&apos;",'"':"&quot;"}[c]));
+  return `<speak version='1.0' xml:lang='pt-BR'><voice name='${voice}'><prosody rate='${rateStr}'>${esc}</prosody></voice></speak>`;
+}
+
+function rateToPercent(speed) { return Math.round((speed - 1) * 100); }
+
+function edgeTTSDirect(text, voice, speed) {
+  return new Promise((resolve, reject) => {
+    const reqId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map(b => b.toString(16).padStart(2,"0")).join("").toUpperCase();
+    const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId=${reqId}`;
+    const ws = new WebSocket(url);
+    const chunks = [];
+    let started = false;
+    const timeout = setTimeout(() => { ws.close(); reject(new Error("Timeout")); }, 20000);
+
+    ws.onopen = () => {
+      const ts = new Date().toISOString();
+      ws.send(
+        `X-Timestamp:${ts}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
+        JSON.stringify({ context: { synthesis: { audio: { metadataoptions: { sentenceBoundaryEnabled: false, wordBoundaryEnabled: false }, outputFormat: "audio-24khz-48kbitrate-mono-mp3" } } } })
+      );
+      ws.send(
+        `X-RequestId:${reqId}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${ts}\r\nPath:ssml\r\n\r\n` +
+        buildSSML(text, voice, rateToPercent(speed))
+      );
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        if (event.data.includes("Path:turn.end")) {
+          clearTimeout(timeout); ws.close();
+          if (!chunks.length) { reject(new Error("Sem áudio")); return; }
+          resolve(URL.createObjectURL(new Blob(chunks, { type: "audio/mpeg" })));
+        }
+      } else {
+        event.data.arrayBuffer().then(buf => {
+          const arr = new Uint8Array(buf);
+          // Find "Path:audio\r\n" header end
+          const headerLen = new DataView(buf).getUint16(0);
+          const headerStr = new TextDecoder().decode(arr.slice(2, 2 + headerLen));
+          if (headerStr.includes("Path:audio")) {
+            started = true;
+            chunks.push(arr.slice(2 + headerLen));
+          } else if (started) {
+            chunks.push(arr);
+          }
+        });
+      }
+    };
+
+    ws.onerror = () => { clearTimeout(timeout); reject(new Error("Erro WebSocket — verifique sua conexão")); };
+    ws.onclose = () => clearTimeout(timeout);
   });
-  if (!res.ok) {
-    const err = await res.json().catch(()=>({}));
-    throw new Error(err.error || "Erro ao gerar áudio");
+}
+
+async function fetchTTS(text, voice="pt-BR-ThalitaNeural", speed=1) {
+  // Tenta WebSocket direto primeiro (funciona no APK)
+  // Se falhar, tenta o servidor proxy (Vercel)
+  try {
+    return await edgeTTSDirect(text.slice(0, 4000), voice, speed);
+  } catch(e) {
+    console.warn("WebSocket direto falhou, tentando proxy:", e.message);
+    const res = await fetch("/api/tts", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ text: text.slice(0,4000), voice, speed }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(()=>({}));
+      throw new Error(err.error || "Erro ao gerar áudio");
+    }
+    const blob = await res.blob();
+    return URL.createObjectURL(blob);
   }
-  const blob = await res.blob();
-  return URL.createObjectURL(blob);
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────
