@@ -83,12 +83,23 @@ function toParagraphs(text) {
   return text.split(/\n{2,}/).map(p=>p.replace(/\s+/g," ").trim()).filter(p=>p.length>30);
 }
 
+const EDGE_VOICES = [
+  { id: "pt-BR-ThalitaNeural",   label: "Thalita — natural e suave 🌸" },
+  { id: "pt-BR-FranciscaNeural", label: "Francisca — mais séria 💼" },
+  { id: "pt-BR-BrendaNeural",    label: "Brenda — moderna 🎧" },
+  { id: "pt-BR-GiovannaNeural",  label: "Giovanna — limpa e clara ✨" },
+  { id: "pt-BR-AntonioNeural",   label: "Antônio — masculina 🎙️" },
+  { id: "pt-BR-DonatoNeural",    label: "Donato — masculina grave 🔊" },
+  { id: "pt-BR-FabioNeural",     label: "Fábio — masculina 🎤" },
+  { id: "pt-BR-HumbertoNeural",  label: "Humberto — masculina 📢" },
+];
+
 // ── TTS via API proxy ────────────────────────────────────────────────────
-async function fetchTTS(text, speed=1) {
+async function fetchTTS(text, voice="pt-BR-ThalitaNeural", speed=1) {
   const res = await fetch("/api/tts", {
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ text: text.slice(0,4000), speed }),
+    body: JSON.stringify({ text: text.slice(0,4000), voice, speed }),
   });
   if (!res.ok) {
     const err = await res.json().catch(()=>({}));
@@ -147,6 +158,7 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [loadingAudio, setLoadingAudio] = useState(false);
   const [speed, setSpeed] = useState(1);
+  const [voice, setVoice] = useState("pt-BR-ThalitaNeural");
   const [statusMsg, setStatusMsg] = useState("");
   const [cachedIdxs, setCachedIdxs] = useState(new Set());
 
@@ -156,6 +168,7 @@ export default function App() {
   const curRef = useRef(0);
   const playingRef = useRef(false);
   const speedRef = useRef(1);
+  const voiceRef = useRef("pt-BR-ThalitaNeural");
   const activeHashRef = useRef("");
   const paraEls = useRef([]);
   // Audio cache: idx -> url
@@ -169,6 +182,7 @@ export default function App() {
   curRef.current = cur;
   playingRef.current = playing;
   speedRef.current = speed;
+  voiceRef.current = voice;
 
   useEffect(() => {
     async function init() {
@@ -200,7 +214,7 @@ export default function App() {
       const key = `${activeHashRef.current}_${i}_${speedRef.current}`;
       if (!audioCache.current[key] && !prefetchQueue.current.has(key)) {
         prefetchQueue.current.add(key);
-        fetchTTS(ps[i], speedRef.current)
+        fetchTTS(ps[i], voiceRef.current, speedRef.current)
           .then(url => {
             audioCache.current[key] = url;
             prefetchQueue.current.delete(key);
@@ -268,7 +282,7 @@ export default function App() {
     try {
       let url = cached;
       if (!url) {
-        url = await fetchTTS(ps[idx], speedRef.current);
+        url = await fetchTTS(ps[idx], voiceRef.current, speedRef.current);
         // Check lock still valid (user didn't skip/stop while loading)
         if (playLock.current !== lockId) return;
         audioCache.current[key] = url;
@@ -418,6 +432,19 @@ export default function App() {
     }
   };
 
+  const changeVoice = v => {
+    audioCache.current = {};
+    prefetchQueue.current.clear();
+    setCachedIdxs(new Set());
+    voiceRef.current = v;
+    setVoice(v);
+    if (playing || loadingAudio) {
+      const idx = curRef.current;
+      stopAudio();
+      setTimeout(() => playParagraph(idx), 80);
+    }
+  };
+
   const pct = paras.length ? Math.round(((cur+1)/paras.length)*100) : 0;
   const btnLabel = loadingAudio ? "⏳ Carregando…" : playing ? "⏸ Pausar" : "▶ Ouvir";
 
@@ -495,9 +522,16 @@ export default function App() {
               <button style={btnP(loadingAudio?C.muted:playing?C.red:C.acc,C.bg)} onClick={handlePlayPause}>{btnLabel}</button>
               <button style={{...btnO,opacity:cur>=paras.length-1?0.4:1}} disabled={cur>=paras.length-1} onClick={()=>playParagraph(cur+1)}>⏭</button>
             </div>
-            <div style={row({justifyContent:"center"})}>
+            <div style={row({justifyContent:"center",marginBottom:10})}>
               <span style={{fontSize:12,color:C.muted}}>Velocidade:</span>
               {SPEEDS.map(s=><button key={s} style={btnT(speed===s)} onClick={()=>changeSpeed(s)}>{s}×</button>)}
+            </div>
+            <div style={row({justifyContent:"center"})}>
+              <span style={{fontSize:12,color:C.muted}}>Voz:</span>
+              <select value={voice} onChange={e=>changeVoice(e.target.value)}
+                style={{background:C.s2,border:`1px solid ${C.border}`,color:C.text,padding:"7px 10px",borderRadius:8,fontSize:13,fontFamily:"inherit",flex:1,maxWidth:280}}>
+                {EDGE_VOICES.map(v=><option key={v.id} value={v.id}>{v.label}</option>)}
+              </select>
             </div>
           </div>
 
