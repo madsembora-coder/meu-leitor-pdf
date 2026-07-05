@@ -104,19 +104,52 @@ function buildSSML(text, voice, rate) {
 
 function rateToPercent(speed) { return Math.round((speed - 1) * 100); }
 
+const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+// Precisa "imitar" uma versão real do Chromium/Edge — a Microsoft valida isso
+// como parte do esquema, embora não pareça exigir o número exato mais recente.
+const SEC_MS_GEC_VERSION = "1-130.0.2849.68";
+
+// A Microsoft passou a exigir, desde ~2024, um token extra (Sec-MS-GEC) além do
+// TrustedClientToken — sem ele, a conexão é recusada com HTTP 403. O token é
+// calculado localmente: hora atual (formato "Windows file time"), arredondada
+// para baixo em blocos de 5 minutos, concatenada com o TrustedClientToken e
+// hasheada em SHA-256. Precisa ser feito com BigInt (não Number) porque o valor
+// em nanosegundos ultrapassa o limite de precisão segura de um Number em JS —
+// usar Number aqui geraria um hash errado e o 403 continuaria acontecendo.
+async function generateSecMsGec() {
+  const WIN_EPOCH = 11644473600n; // segundos entre 1601-01-01 e 1970-01-01
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  let ticks = nowSec + WIN_EPOCH;
+  ticks -= ticks % 300n;           // arredonda para baixo em blocos de 5 min
+  ticks *= 10000000n;              // segundos -> intervalos de 100ns
+  const strToHash = ticks.toString() + TRUSTED_CLIENT_TOKEN;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(strToHash));
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
 function edgeTTSDirect(text, voice, speed) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     const reqId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
       .map(b => b.toString(16).padStart(2,"0")).join("").toUpperCase();
-    const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4&ConnectionId=${reqId}`;
+    let secMsGec;
+    try {
+      secMsGec = await generateSecMsGec();
+    } catch (e) {
+      reject(new Error("Falha ao gerar token de segurança"));
+      return;
+    }
+    const url = `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1`
+      + `?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}`
+      + `&Sec-MS-GEC=${secMsGec}`
+      + `&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}`
+      + `&ConnectionId=${reqId}`;
     const ws = new WebSocket(url);
     const chunks = [];
     let started = false;
-    // Reduzido de 20s para 8s: o token usado aqui não é oficial da Microsoft e
-    // pode ser limitado/bloqueado periodicamente. Quando isso acontece, a conexão
-    // fica "pendurada" sem responder — 20s de espera é o que causava a sensação
-    // de "está sempre carregando" ao trocar de parágrafo. Com 8s, falha mais rápido
-    // e cai no fallback (ou mostra erro) sem prender o usuário esperando tanto.
+    // Reduzido de 20s para 8s: quando a conexão trava sem responder (mesmo com o
+    // token certo, a Microsoft pode limitar por IP/uso), 20s de espera é o que
+    // causava a sensação de "está sempre carregando" ao trocar de parágrafo.
     const timeout = setTimeout(() => { ws.close(); reject(new Error("Timeout")); }, 8000);
 
     ws.onopen = () => {
