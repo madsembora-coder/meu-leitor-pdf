@@ -112,7 +112,12 @@ function edgeTTSDirect(text, voice, speed) {
     const ws = new WebSocket(url);
     const chunks = [];
     let started = false;
-    const timeout = setTimeout(() => { ws.close(); reject(new Error("Timeout")); }, 20000);
+    // Reduzido de 20s para 8s: o token usado aqui não é oficial da Microsoft e
+    // pode ser limitado/bloqueado periodicamente. Quando isso acontece, a conexão
+    // fica "pendurada" sem responder — 20s de espera é o que causava a sensação
+    // de "está sempre carregando" ao trocar de parágrafo. Com 8s, falha mais rápido
+    // e cai no fallback (ou mostra erro) sem prender o usuário esperando tanto.
+    const timeout = setTimeout(() => { ws.close(); reject(new Error("Timeout")); }, 8000);
 
     ws.onopen = () => {
       const ts = new Date().toISOString();
@@ -274,19 +279,27 @@ export default function App() {
   }, [activeBook]);
 
   // ── Prefetch helper ──────────────────────────────────────────────────
-  const prefetch = useCallback((idx, count=3) => {
+  // Antes: só buscava 3 parágrafos à frente, e só quando o atual começava a
+  // tocar — margem pequena demais. Agora busca PREFETCH_AHEAD parágrafos e
+  // faz isso um de cada vez (sequencial), em vez de abrir várias conexões
+  // simultâneas ao servidor da Microsoft (o que aumenta o risco de sermos
+  // limitados/bloqueados, já que o endpoint usado não é oficial).
+  const PREFETCH_AHEAD = 6;
+  const prefetch = useCallback(async (idx, count = PREFETCH_AHEAD) => {
     const ps = parasRef.current;
-    for (let i = idx; i < Math.min(idx+count, ps.length); i++) {
+    const end = Math.min(idx + count, ps.length);
+    for (let i = idx; i < end; i++) {
       const key = `${activeHashRef.current}_${i}_${speedRef.current}`;
-      if (!audioCache.current[key] && !prefetchQueue.current.has(key)) {
-        prefetchQueue.current.add(key);
-        fetchTTS(ps[i], voiceRef.current, speedRef.current)
-          .then(url => {
-            audioCache.current[key] = url;
-            prefetchQueue.current.delete(key);
-            setCachedIdxs(prev => new Set([...prev, i]));
-          })
-          .catch(() => prefetchQueue.current.delete(key));
+      if (audioCache.current[key] || prefetchQueue.current.has(key)) continue;
+      prefetchQueue.current.add(key);
+      try {
+        const url = await fetchTTS(ps[i], voiceRef.current, speedRef.current);
+        audioCache.current[key] = url;
+        setCachedIdxs(prev => new Set([...prev, i]));
+      } catch {
+        // ignora falha de um parágrafo específico e continua tentando os próximos
+      } finally {
+        prefetchQueue.current.delete(key);
       }
     }
   }, []);
@@ -295,10 +308,22 @@ export default function App() {
   const stopAudio = useCallback(() => {
     playLock.current = false;
     if (audioRef.current) {
-      audioRef.current.onended = null;
-      audioRef.current.onerror = null;
-      audioRef.current.pause();
-      audioRef.current.src = "";
+      const old = audioRef.current;
+      // Desconecta TODOS os handlers, inclusive onplay (antes só onended/onerror
+      // eram limpos — se o play() anterior ainda estivesse "pendurado", o onplay
+      // podia disparar depois do pause() e reativar o mediaSession como "playing").
+      old.onplay = null;
+      old.onended = null;
+      old.onerror = null;
+      old.pause();
+      // Usar removeAttribute em vez de src="" evita que o WebView tente
+      // (às vezes) recarregar a própria página como se fosse um arquivo de mídia.
+      old.removeAttribute("src");
+      // load() força o elemento a abortar qualquer play()/buffer pendente e
+      // resetar o estado interno do player nativo do WebView — é isso que
+      // realmente garante que o áudio antigo pare, em vez de só pause()+src=""
+      // (que em muitos WebViews Android não é síncrono/confiável sozinho).
+      old.load();
       audioRef.current = null;
     }
     setPlaying(false);
@@ -368,7 +393,7 @@ export default function App() {
         setStatusMsg(`▶ Parágrafo ${idx+1} de ${ps.length}`);
         if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
         // Prefetch next 3 paragraphs while playing
-        prefetch(idx+1, 3);
+        prefetch(idx+1);
       };
 
       audio.onended = () => {
@@ -421,8 +446,9 @@ export default function App() {
       setActiveBook(book); setView("reader");
       const msg = savedIdx>0 ? `📌 Retomando do parágrafo ${savedIdx+1}` : `${ps.length} parágrafos • Toque ▶ para ouvir`;
       setStatusMsg(msg);
-      // Prefetch first 3 paragraphs immediately
-      setTimeout(() => prefetch(savedIdx, 3), 300);
+      // Começa a preparar os áudios ANTES de você apertar play — antes buscava
+      // só 3 parágrafos; agora usa a mesma margem (PREFETCH_AHEAD) do resto do app.
+      setTimeout(() => prefetch(savedIdx), 300);
     } catch(e) { setErrMsg(e.message); setView("library"); }
   }, [stopAudio, prefetch]);
 
@@ -456,7 +482,7 @@ export default function App() {
       audioCache.current={}; prefetchQueue.current.clear(); setCachedIdxs(new Set());
       setActiveBook(book); setView("reader");
       setStatusMsg(`${ps.length} parágrafos prontos • Toque ▶ para ouvir!`);
-      setTimeout(() => prefetch(0, 3), 300);
+      setTimeout(() => prefetch(0), 300);
     } catch(e) { setErrMsg(e.message||"Erro ao processar o PDF."); setView("library"); }
   }, [openBook, stopAudio, prefetch]);
 
