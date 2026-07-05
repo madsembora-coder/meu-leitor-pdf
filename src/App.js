@@ -192,17 +192,43 @@ function edgeTTSDirect(text, voice, speed) {
   });
 }
 
+const TTS_WORKER_URL = "https://meu-tts.madsembora.workers.dev/v1/audio/speech";
+
+// Chama o Worker no Cloudflare (roda no servidor — imita o app oficial de
+// tradutor da Microsoft, com assinatura HMAC, então não esbarra nas mesmas
+// restrições de cabeçalho que o WebSocket direto do WebView tem).
+async function fetchTTSFromWorker(text, voice, speed) {
+  const res = await fetch(TTS_WORKER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input: text, voice, speed: String(speed) }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Worker error: ${res.status}`);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
 async function fetchTTS(text, voice="pt-BR-ThalitaNeural", speed=1) {
-  // Tenta WebSocket direto primeiro (funciona no APK)
-  // Se falhar, tenta o servidor proxy (Vercel)
+  const clipped = text.slice(0, 4000);
+  // 1) Worker no Cloudflare primeiro — é a fonte mais estável hoje, já que o
+  //    WebSocket direto está sendo bloqueado pela Microsoft (erro 403).
   try {
-    return await edgeTTSDirect(text.slice(0, 4000), voice, speed);
+    return await fetchTTSFromWorker(clipped, voice, speed);
+  } catch (e) {
+    console.warn("Worker Cloudflare falhou, tentando WebSocket direto:", e.message);
+  }
+  // 2) Fallback: WebSocket direto ao endpoint "Read Aloud" da Microsoft
+  try {
+    return await edgeTTSDirect(clipped, voice, speed);
   } catch(e) {
-    console.warn("WebSocket direto falhou, tentando proxy:", e.message);
+    console.warn("WebSocket direto falhou, tentando proxy /api/tts:", e.message);
     const res = await fetch("/api/tts", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ text: text.slice(0,4000), voice, speed }),
+      body: JSON.stringify({ text: clipped, voice, speed }),
     });
     if (!res.ok) {
       const err = await res.json().catch(()=>({}));
