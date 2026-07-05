@@ -47,7 +47,20 @@ function loadPdfJs() {
     document.head.appendChild(s);
   });
 }
-async function renderCover(buffer) {
+// EPUB é, por baixo dos panos, um arquivo .zip com capítulos em XHTML — o JSZip
+// é só pra abrir esse zip. Carregado dinamicamente do mesmo jeito que o pdf.js,
+// sem precisar de "npm install" nem mexer no processo de build do app.
+function loadJSZip() {
+  return new Promise((resolve, reject) => {
+    if (window.JSZip) { resolve(window.JSZip); return; }
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    s.onload = () => resolve(window.JSZip);
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+async function renderCoverPdf(buffer) {
   try {
     const lib = await loadPdfJs();
     const pdf = await lib.getDocument({ data: buffer.slice(0) }).promise;
@@ -61,7 +74,28 @@ async function renderCover(buffer) {
     return canvas.toDataURL("image/jpeg", 0.8);
   } catch { return null; }
 }
-async function extractAllText(buffer, onProgress) {
+async function renderCoverEpub(buffer) {
+  try {
+    const { opfDoc, opfDir, zip } = await readEpubOpf(buffer);
+    // Procura a imagem de capa declarada no manifest (padrão mais comum em EPUB)
+    const manifestItems = Array.from(opfDoc.querySelectorAll("manifest > item"));
+    const coverItem = manifestItems.find(it => /cover/i.test(it.getAttribute("properties")||"") )
+      || manifestItems.find(it => /cover/i.test(it.getAttribute("id")||"") && (it.getAttribute("media-type")||"").startsWith("image/"));
+    if (!coverItem) return null;
+    const href = coverItem.getAttribute("href");
+    const file = zip.file(opfDir + href) || zip.file(decodeURIComponent(opfDir + href));
+    if (!file) return null;
+    const base64 = await file.async("base64");
+    const mime = coverItem.getAttribute("media-type") || "image/jpeg";
+    return `data:${mime};base64,${base64}`;
+  } catch { return null; }
+}
+async function renderCover(buffer, format) {
+  if (format === "epub") return renderCoverEpub(buffer);
+  if (format === "pdf") return renderCoverPdf(buffer);
+  return null; // TXT não tem capa
+}
+async function extractPdfText(buffer, onProgress) {
   const lib = await loadPdfJs();
   const pdf = await lib.getDocument({ data: buffer }).promise;
   const n = pdf.numPages;
@@ -79,6 +113,70 @@ async function extractAllText(buffer, onProgress) {
   }
   return { text, numPages: n };
 }
+
+// Lê o "índice" de um EPUB: primeiro o container.xml (que aponta pro .opf),
+// depois o próprio .opf (que lista os capítulos e a ordem de leitura certa).
+async function readEpubOpf(buffer) {
+  const JSZip = await loadJSZip();
+  const zip = await JSZip.loadAsync(buffer);
+  const containerXml = await zip.file("META-INF/container.xml").async("string");
+  const containerDoc = new DOMParser().parseFromString(containerXml, "application/xml");
+  const opfPath = containerDoc.querySelector("rootfile").getAttribute("full-path");
+  const opfDir = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/")+1) : "";
+  const opfXml = await zip.file(opfPath).async("string");
+  const opfDoc = new DOMParser().parseFromString(opfXml, "application/xml");
+  return { opfDoc, opfDir, zip };
+}
+
+async function extractEpubText(buffer, onProgress) {
+  const { opfDoc, opfDir, zip } = await readEpubOpf(buffer);
+  const manifest = {};
+  opfDoc.querySelectorAll("manifest > item").forEach(item => {
+    manifest[item.getAttribute("id")] = item.getAttribute("href");
+  });
+  const spineIds = Array.from(opfDoc.querySelectorAll("spine > itemref"))
+    .map(ref => ref.getAttribute("idref"));
+
+  let text = "";
+  for (let i = 0; i < spineIds.length; i++) {
+    const href = manifest[spineIds[i]];
+    if (href) {
+      const fullPath = opfDir + href;
+      const file = zip.file(fullPath) || zip.file(decodeURIComponent(fullPath));
+      if (file) {
+        const html = await file.async("string");
+        // XHTML às vezes vem malformado; se der erro de parse, tenta como HTML solto
+        let doc = new DOMParser().parseFromString(html, "application/xhtml+xml");
+        if (doc.querySelector("parsererror")) doc = new DOMParser().parseFromString(html, "text/html");
+        const chapterText = (doc.body?.textContent || "").trim();
+        if (chapterText) text += chapterText + "\n\n";
+      }
+    }
+    onProgress && onProgress(Math.round(((i+1)/spineIds.length)*100));
+  }
+  return { text, numPages: spineIds.length };
+}
+
+async function extractTxtText(buffer, onProgress) {
+  const text = new TextDecoder("utf-8").decode(buffer);
+  onProgress && onProgress(100);
+  return { text, numPages: 1 };
+}
+
+async function extractAllText(buffer, format, onProgress) {
+  if (format === "epub") return extractEpubText(buffer, onProgress);
+  if (format === "txt") return extractTxtText(buffer, onProgress);
+  return extractPdfText(buffer, onProgress);
+}
+
+function detectFormat(file) {
+  const name = (file.name || "").toLowerCase();
+  if (name.endsWith(".epub") || file.type === "application/epub+zip") return "epub";
+  if (name.endsWith(".txt") || file.type === "text/plain") return "txt";
+  if (name.endsWith(".mobi") || name.endsWith(".azw") || name.endsWith(".azw3")) return "unsupported";
+  return "pdf";
+}
+
 function toParagraphs(text) {
   return text.split(/\n{2,}/).map(p=>p.replace(/\s+/g," ").trim()).filter(p=>p.length>30);
 }
@@ -245,7 +343,7 @@ async function hashBuffer(buf) {
   return Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,"0")).join("").slice(0,14);
 }
 
-const SPEEDS = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const SPEEDS = [0.75, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 const C = { bg:"#0e0c14", s1:"#17141f", s2:"#211d2e", border:"#2d2840", acc:"#e8c97a", acc2:"#f5dfa0", text:"#f0ebe0", muted:"#7a7490", red:"#f87171", green:"#6ee7b7" };
 
 // ── BookCard ──────────────────────────────────────────────────────────────
@@ -532,7 +630,7 @@ export default function App() {
       const byteStr = atob(book.b64);
       const bytes = new Uint8Array(byteStr.length);
       for (let i=0;i<byteStr.length;i++) bytes[i]=byteStr.charCodeAt(i);
-      const { text } = await extractAllText(bytes.buffer, p => {
+      const { text } = await extractAllText(bytes.buffer, book.format || "pdf", p => {
         setLoadPct(10+Math.round(p*0.9)); setLoadMsg(`Carregando… ${10+Math.round(p*0.9)}%`);
       });
       const ps = toParagraphs(text);
@@ -555,26 +653,33 @@ export default function App() {
 
   // ── Add book ─────────────────────────────────────────────────────────
   const addBook = useCallback(async (file) => {
-    if (!file || file.type!=="application/pdf") return;
-    stopAudio(); setView("loading"); setErrMsg(""); setLoadPct(0); setLoadMsg("Lendo PDF…");
+    if (!file) return;
+    const format = detectFormat(file);
+    if (format === "unsupported") {
+      setErrMsg("Formato .mobi/.azw ainda não é suportado — é um formato fechado da Amazon, difícil de ler direto no navegador. Converta para .epub (o Calibre, gratuito, faz isso em segundos) e importe de novo.");
+      setView("library");
+      return;
+    }
+    const formatLabel = { pdf:"PDF", epub:"EPUB", txt:"TXT" }[format];
+    stopAudio(); setView("loading"); setErrMsg(""); setLoadPct(0); setLoadMsg(`Lendo ${formatLabel}…`);
     try {
       const buffer = await file.arrayBuffer();
       const hash = await hashBuffer(buffer);
       const existing = await dbGet("books", hash);
       if (existing) { openBook(existing); return; }
       setLoadMsg("Gerando capa…"); setLoadPct(15);
-      const cover = await renderCover(buffer.slice(0));
+      const cover = await renderCover(buffer.slice(0), format);
       setLoadMsg("Extraindo texto…");
-      const { text, numPages } = await extractAllText(buffer.slice(0), p => {
+      const { text, numPages } = await extractAllText(buffer.slice(0), format, p => {
         setLoadPct(20+Math.round(p*0.78)); setLoadMsg(`Extraindo… ${20+Math.round(p*0.78)}%`);
       });
       const ps = toParagraphs(text);
-      if (!ps.length) throw new Error("Nenhum texto encontrado. PDF pode ser escaneado.");
+      if (!ps.length) throw new Error(`Nenhum texto encontrado. ${format==="pdf" ? "PDF pode ser escaneado." : "Arquivo pode estar corrompido."}`);
       setLoadMsg("Salvando…"); setLoadPct(99);
       const bytes = new Uint8Array(buffer);
       let b64=""; const chunk=8192;
       for (let i=0;i<bytes.length;i+=chunk) b64+=String.fromCharCode(...bytes.subarray(i,i+chunk));
-      const book = { hash, title:file.name.replace(/\.pdf$/i,""), numPages, cover, b64:btoa(b64), lastPara:0, totalParas:ps.length, addedAt:Date.now() };
+      const book = { hash, title:file.name.replace(/\.(pdf|epub|txt)$/i,""), format, numPages, cover, b64:btoa(b64), lastPara:0, totalParas:ps.length, addedAt:Date.now() };
       await dbPut("books", book);
       setLibrary(prev=>[book,...prev]);
       setParas(ps); parasRef.current=ps;
@@ -585,7 +690,7 @@ export default function App() {
       setStatusMsg(`${ps.length} parágrafos prontos • Toque ▶ para ouvir!`);
       prefetchTargetRef.current = 0;
       setTimeout(runPrefetchLoop, 300);
-    } catch(e) { setErrMsg(e.message||"Erro ao processar o PDF."); setView("library"); }
+    } catch(e) { setErrMsg(e.message||"Erro ao processar o arquivo."); setView("library"); }
   }, [openBook, stopAudio, runPrefetchLoop]);
 
   const deleteBook = useCallback(async (hash) => {
@@ -674,8 +779,8 @@ export default function App() {
           <label style={{display:"block",border:`2px dashed ${C.border}`,borderRadius:14,padding:"28px 20px",textAlign:"center",cursor:"pointer",background:C.s1,marginBottom:32,position:"relative"}}>
             <div style={{fontSize:36,marginBottom:8}}>➕</div>
             <div style={{fontWeight:700,fontSize:16,color:C.acc,marginBottom:4}}>Adicionar livro</div>
-            <div style={{color:C.muted,fontSize:13}}>Clique ou arraste um PDF</div>
-            <input type="file" accept=".pdf" style={{position:"absolute",inset:0,opacity:0,cursor:"pointer",width:"100%",height:"100%"}} onChange={e=>addBook(e.target.files[0])}/>
+            <div style={{color:C.muted,fontSize:13}}>Clique ou arraste um PDF, EPUB ou TXT</div>
+            <input type="file" accept=".pdf,.epub,.txt" style={{position:"absolute",inset:0,opacity:0,cursor:"pointer",width:"100%",height:"100%"}} onChange={e=>addBook(e.target.files[0])}/>
           </label>
           {library.length>0
             ? <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:"24px 18px"}}>
