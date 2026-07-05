@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ── IndexedDB ─────────────────────────────────────────────────────────────
-const DB_NAME = "leitorpdf_db", DB_VERSION = 1;
+// DB_VERSION subiu de 1 para 2 para adicionar a store "audio" (cache de áudio
+// offline). O onupgradeneeded roda tanto em instalações novas quanto em quem
+// já tinha a versão 1 salva no aparelho, criando só o que ainda não existe.
+const DB_NAME = "leitorpdf_db", DB_VERSION = 2;
 function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -9,6 +12,7 @@ function openDB() {
       const db = e.target.result;
       if (!db.objectStoreNames.contains("books")) db.createObjectStore("books", { keyPath:"hash" });
       if (!db.objectStoreNames.contains("progress")) db.createObjectStore("progress", { keyPath:"hash" });
+      if (!db.objectStoreNames.contains("audio")) db.createObjectStore("audio", { keyPath:"key" });
     };
     req.onsuccess = e => resolve(e.target.result);
     req.onerror = () => reject(req.error);
@@ -267,7 +271,7 @@ function edgeTTSDirect(text, voice, speed) {
         if (event.data.includes("Path:turn.end")) {
           clearTimeout(timeout); ws.close();
           if (!chunks.length) { reject(new Error("Sem áudio")); return; }
-          resolve(URL.createObjectURL(new Blob(chunks, { type: "audio/mpeg" })));
+          resolve(new Blob(chunks, { type: "audio/mpeg" }));
         }
       } else {
         event.data.arrayBuffer().then(buf => {
@@ -305,20 +309,19 @@ async function fetchTTSFromWorker(text, voice, speed) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `Worker error: ${res.status}`);
   }
-  const blob = await res.blob();
-  return URL.createObjectURL(blob);
+  return await res.blob();
 }
 
-async function fetchTTS(text, voice="pt-BR-ThalitaNeural", speed=1) {
+// Busca o áudio como Blob (pronto pra tocar OU guardar no IndexedDB para uso
+// offline), tentando nessa ordem: Worker no Cloudflare -> WebSocket direto ->
+// proxy /api/tts.
+async function fetchTTSBlob(text, voice="pt-BR-ThalitaNeural", speed=1) {
   const clipped = text.slice(0, 4000);
-  // 1) Worker no Cloudflare primeiro — é a fonte mais estável hoje, já que o
-  //    WebSocket direto está sendo bloqueado pela Microsoft (erro 403).
   try {
     return await fetchTTSFromWorker(clipped, voice, speed);
   } catch (e) {
     console.warn("Worker Cloudflare falhou, tentando WebSocket direto:", e.message);
   }
-  // 2) Fallback: WebSocket direto ao endpoint "Read Aloud" da Microsoft
   try {
     return await edgeTTSDirect(clipped, voice, speed);
   } catch(e) {
@@ -332,9 +335,66 @@ async function fetchTTS(text, voice="pt-BR-ThalitaNeural", speed=1) {
       const err = await res.json().catch(()=>({}));
       throw new Error(err.error || "Erro ao gerar áudio");
     }
-    const blob = await res.blob();
-    return URL.createObjectURL(blob);
+    return await res.blob();
   }
+}
+
+// ── Cache de áudio offline (IndexedDB) ──────────────────────────────────
+// Guarda o Blob do MP3 de cada parágrafo já gerado, para tocar de novo sem
+// internet — inclusive depois de fechar e reabrir o app. A chave inclui
+// livro + parágrafo + voz + velocidade, porque o áudio muda conforme esses 4.
+function audioKey(hash, idx, voice, speed) { return `${hash}__${idx}__${voice}__${speed}`; }
+
+async function audioDbGet(key) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const r = db.transaction("audio","readonly").objectStore("audio").get(key);
+    r.onsuccess = () => res(r.result || null);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function audioDbPut(key, blob, meta) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("audio","readwrite");
+    tx.objectStore("audio").put({ key, blob, ...meta, savedAt: Date.now() });
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+// Lista quais índices de parágrafo já estão baixados para um livro+voz+velocidade
+async function audioDbIndexesForBook(hash, voice, speed) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("audio","readonly");
+    const store = tx.objectStore("audio");
+    const range = IDBKeyRange.bound(hash+"__", hash+"__\uffff");
+    const req = store.openCursor(range);
+    const found = new Set();
+    req.onsuccess = e => {
+      const cursor = e.target.result;
+      if (cursor) {
+        const v = cursor.value;
+        if (v.voice === voice && v.speed === speed) found.add(v.idx);
+        cursor.continue();
+      } else res(found);
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+// Apaga todo o áudio offline salvo de um livro (todas as vozes/velocidades)
+async function audioDbDeleteForBook(hash) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("audio","readwrite");
+    const store = tx.objectStore("audio");
+    const range = IDBKeyRange.bound(hash+"__", hash+"__\uffff");
+    const req = store.openCursor(range);
+    req.onsuccess = e => {
+      const cursor = e.target.result;
+      if (cursor) { cursor.delete(); cursor.continue(); }
+    };
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────
@@ -389,6 +449,7 @@ export default function App() {
   const [voice, setVoice] = useState("pt-BR-ThalitaNeural");
   const [statusMsg, setStatusMsg] = useState("");
   const [cachedIdxs, setCachedIdxs] = useState(new Set());
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
 
   // Refs
   const audioRef = useRef(null);
@@ -399,7 +460,8 @@ export default function App() {
   const voiceRef = useRef("pt-BR-ThalitaNeural");
   const activeHashRef = useRef("");
   const paraEls = useRef([]);
-  // Audio cache: idx -> url
+  // Audio cache: idx -> url (cache em memória, só dura a sessão atual — o
+  // que garante o modo offline de verdade é o IndexedDB, não isso aqui)
   const audioCache = useRef({});
   // Mutex: prevents double-play
   const playLock = useRef(false);
@@ -439,6 +501,55 @@ export default function App() {
     navigator.mediaSession.setActionHandler("nexttrack", () => { if(curRef.current<parasRef.current.length-1) playParagraph(curRef.current+1); });
   }, [activeBook]);
 
+  // ── Detecção de online/offline ────────────────────────────────────────
+  // Quando a internet volta, retoma o loop de pré-carregamento de onde ele
+  // parou (ele mesmo se pausa quando fica sem conexão e sem cache local).
+  useEffect(() => {
+    const goOnline = () => { setIsOnline(true); runPrefetchLoop(); };
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Resolve a URL de áudio de um parágrafo ──────────────────────────────
+  // Ordem de busca: memória (mais rápido) -> IndexedDB (já baixado antes,
+  // funciona offline) -> rede (Cloudflare/WebSocket/proxy). Toda vez que busca
+  // da rede, salva no IndexedDB também — assim, da próxima vez (mesmo sem
+  // internet) já está disponível.
+  const resolveAudioUrl = useCallback(async (idx) => {
+    const hash = activeHashRef.current;
+    const voiceNow = voiceRef.current;
+    const speedNow = speedRef.current;
+    const text = parasRef.current[idx];
+    const key = audioKey(hash, idx, voiceNow, speedNow);
+
+    if (audioCache.current[key]) return audioCache.current[key];
+
+    try {
+      const rec = await audioDbGet(key);
+      if (rec && rec.blob) {
+        const url = URL.createObjectURL(rec.blob);
+        audioCache.current[key] = url;
+        setCachedIdxs(prev => new Set(prev).add(idx));
+        return url;
+      }
+    } catch { /* nada salvo ainda, segue pro próximo passo */ }
+
+    if (!navigator.onLine) {
+      throw new Error("OFFLINE_NOT_CACHED");
+    }
+
+    const blob = await fetchTTSBlob(text, voiceNow, speedNow);
+    try { await audioDbPut(key, blob, { hash, idx, voice: voiceNow, speed: speedNow }); }
+    catch (e) { console.warn("Não foi possível salvar o áudio offline:", e); }
+    const url = URL.createObjectURL(blob);
+    audioCache.current[key] = url;
+    setCachedIdxs(prev => new Set(prev).add(idx));
+    return url;
+  }, []);
+
   // ── Loop contínuo de pré-carregamento ─────────────────────────────────
   // Diferente da versão anterior (que buscava só N parágrafos e parava), este
   // loop roda sozinho em segundo plano e não para: ele começa em
@@ -459,7 +570,7 @@ export default function App() {
         const i = prefetchTargetRef.current;
         if (!ps.length || i >= ps.length) return; // chegou ao fim do livro — pronto
 
-        const key = `${activeHashRef.current}_${i}_${speedRef.current}`;
+        const key = audioKey(activeHashRef.current, i, voiceRef.current, speedRef.current);
 
         if (audioCache.current[key]) {
           prefetchTargetRef.current = i + 1;
@@ -474,13 +585,17 @@ export default function App() {
 
         prefetchQueue.current.add(key);
         try {
-          const url = await fetchTTS(ps[i], voiceRef.current, speedRef.current);
+          await resolveAudioUrl(i);
           if (gen !== prefetchGenRef.current) return;
-          audioCache.current[key] = url;
-          setCachedIdxs(prev => new Set([...prev, i]));
           prefetchTargetRef.current = i + 1;
-        } catch {
+        } catch (e) {
           if (gen !== prefetchGenRef.current) return;
+          if (e.message === "OFFLINE_NOT_CACHED") {
+            // Sem internet e esse trecho ainda não foi baixado — não adianta
+            // insistir nos próximos, eles também não vão estar. Pausa aqui;
+            // o listener de "online" reinicia o loop quando a conexão voltar.
+            return;
+          }
           // Um parágrafo específico falhou (ex.: instabilidade momentânea de rede).
           // Espera um pouco e segue para o próximo, em vez de travar o loop inteiro.
           await new Promise(r => setTimeout(r, 1500));
@@ -490,13 +605,27 @@ export default function App() {
         }
       }
     })();
-  }, []);
+  }, [resolveAudioUrl]);
 
   // Compatibilidade: playParagraph usa isso pra garantir que o loop de fundo
   // nunca fique "para trás" da posição atual de leitura — se o usuário pular
   // pra frente, o alvo do loop pula junto (sem reiniciar, sem duplicar buscas).
   const ensurePrefetchAhead = useCallback((idx) => {
     if (idx > prefetchTargetRef.current) prefetchTargetRef.current = idx;
+  }, []);
+
+  // ── Baixar o livro inteiro para ouvir offline ──────────────────────────
+  // Reaproveita o mesmo loop de pré-carregamento, só que forçando o alvo lá
+  // do início (índice 0) em vez de "a partir de onde você está lendo".
+  const downloadForOffline = useCallback(() => {
+    prefetchTargetRef.current = 0;
+    runPrefetchLoop();
+  }, [runPrefetchLoop]);
+
+  const removeOfflineAudio = useCallback(async () => {
+    await audioDbDeleteForBook(activeHashRef.current);
+    audioCache.current = {};
+    setCachedIdxs(new Set());
   }, []);
 
   // ── Stop all audio completely ────────────────────────────────────────
@@ -555,10 +684,10 @@ export default function App() {
 
     paraEls.current[idx]?.scrollIntoView({ behavior:"smooth", block:"center" });
 
-    const key = `${activeHashRef.current}_${idx}_${speedRef.current}`;
-    const cached = audioCache.current[key];
+    const key = audioKey(activeHashRef.current, idx, voiceRef.current, speedRef.current);
+    const cachedInMemory = audioCache.current[key];
 
-    if (!cached) {
+    if (!cachedInMemory) {
       setLoadingAudio(true);
       setStatusMsg(`⏳ Carregando ${idx+1}/${ps.length}…`);
     } else {
@@ -566,15 +695,7 @@ export default function App() {
     }
 
     try {
-      let url = cached;
-      if (!url) {
-        url = await fetchTTS(ps[idx], voiceRef.current, speedRef.current);
-        // Check lock still valid (user didn't skip/stop while loading)
-        if (playLock.current !== lockId) return;
-        audioCache.current[key] = url;
-        setCachedIdxs(prev => new Set([...prev, idx]));
-      }
-
+      const url = await resolveAudioUrl(idx);
       if (playLock.current !== lockId) return;
 
       const audio = new Audio(url);
@@ -615,9 +736,13 @@ export default function App() {
     } catch(e) {
       if (playLock.current !== lockId) return;
       setLoadingAudio(false); setPlaying(false);
-      setStatusMsg("Erro: " + e.message);
+      if (e.message === "OFFLINE_NOT_CACHED") {
+        setStatusMsg("📴 Sem internet e este trecho ainda não foi baixado.");
+      } else {
+        setStatusMsg("Erro: " + e.message);
+      }
     }
-  }, [stopAudio, ensurePrefetchAhead]);
+  }, [stopAudio, ensurePrefetchAhead, resolveAudioUrl]);
 
   // ── Open book ────────────────────────────────────────────────────────
   const openBook = useCallback(async (book) => {
@@ -643,6 +768,13 @@ export default function App() {
       setActiveBook(book); setView("reader");
       const msg = savedIdx>0 ? `📌 Retomando do parágrafo ${savedIdx+1}` : `${ps.length} parágrafos • Toque ▶ para ouvir`;
       setStatusMsg(msg);
+      // Verifica quais parágrafos, para esta voz/velocidade, já foram baixados
+      // em uma sessão anterior — pra mostrar os pontinhos verdes e o progresso
+      // do download offline imediatamente, sem precisar regerar nada.
+      try {
+        const idxs = await audioDbIndexesForBook(book.hash, voiceRef.current, speedRef.current);
+        setCachedIdxs(idxs);
+      } catch { /* ignora — segue sem marcação de cache */ }
       // Começa a gerar o áudio em segundo plano AGORA, a partir de onde você
       // parou — e não vai parar até chegar ao fim do livro (ou até você trocar
       // de velocidade/voz, quando reinicia a partir da posição atual).
@@ -695,6 +827,7 @@ export default function App() {
 
   const deleteBook = useCallback(async (hash) => {
     await dbDelete("books", hash); await dbDelete("progress", hash);
+    await audioDbDeleteForBook(hash);
     setLibrary(prev=>prev.filter(b=>b.hash!==hash));
   }, []);
 
@@ -718,18 +851,19 @@ export default function App() {
   };
 
   const changeSpeed = s => {
-    // Clear cache since speed changed
+    // Cache em memória fica obsoleto (mudou velocidade), mas o que já foi
+    // baixado no IndexedDB para OUTRAS velocidades continua salvo — nada é apagado.
     audioCache.current = {};
     prefetchQueue.current.clear();
-    setCachedIdxs(new Set());
     speedRef.current = s;
     setSpeed(s);
     // Sem isso, o loop de fundo continuava marchando pra frente de onde já tinha
     // chegado antes da troca — os parágrafos entre a posição atual e ali ficavam
-    // com o cache limpo e sem ninguém regerando, até você realmente chegar neles.
+    // sem ninguém regerando, até você realmente chegar neles.
     // Reiniciar o alvo na posição atual + nova geração faz o loop recomeçar dali,
     // cobrindo de novo (com a nova velocidade) tudo que ainda falta ler.
     prefetchTargetRef.current = curRef.current;
+    audioDbIndexesForBook(activeHashRef.current, voiceRef.current, s).then(setCachedIdxs).catch(()=>setCachedIdxs(new Set()));
     runPrefetchLoop();
     if (playing || loadingAudio) {
       const idx = curRef.current;
@@ -741,13 +875,13 @@ export default function App() {
   const changeVoice = v => {
     audioCache.current = {};
     prefetchQueue.current.clear();
-    setCachedIdxs(new Set());
     voiceRef.current = v;
     setVoice(v);
     // Mesmo motivo do changeSpeed: reinicia o loop de fundo a partir de onde
     // você está agora, com a nova voz, em vez de deixá-lo continuar de onde
     // tinha parado (o que deixaria um buraco de parágrafos sem áudio pronto).
     prefetchTargetRef.current = curRef.current;
+    audioDbIndexesForBook(activeHashRef.current, v, speedRef.current).then(setCachedIdxs).catch(()=>setCachedIdxs(new Set()));
     runPrefetchLoop();
     if (playing || loadingAudio) {
       const idx = curRef.current;
@@ -758,6 +892,8 @@ export default function App() {
 
   const pct = paras.length ? Math.round(((cur+1)/paras.length)*100) : 0;
   const btnLabel = loadingAudio ? "⏳ Carregando…" : playing ? "⏸ Pausar" : "▶ Ouvir";
+  const offlinePct = paras.length ? Math.round((cachedIdxs.size/paras.length)*100) : 0;
+  const fullyDownloaded = paras.length>0 && cachedIdxs.size >= paras.length;
 
   const card = (e={}) => ({background:C.s1,border:`1px solid ${C.border}`,borderRadius:14,padding:18,marginBottom:14,...e});
   const row = (e={}) => ({display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",...e});
@@ -809,6 +945,7 @@ export default function App() {
           <div style={row({marginBottom:16})}>
             <button style={{...btnO,padding:"7px 14px"}} onClick={()=>{stopAudio();setView("library");}}>← Biblioteca</button>
             <div style={{flex:1,fontSize:14,fontWeight:700,color:C.acc2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",textAlign:"center"}}>{activeBook?.title}</div>
+            {!isOnline && <div style={{fontSize:11,color:C.red,whiteSpace:"nowrap",fontWeight:700}}>📴 Offline</div>}
             <div style={{fontSize:11,color:C.muted,whiteSpace:"nowrap"}}>{activeBook?.numPages} págs</div>
           </div>
 
@@ -844,6 +981,23 @@ export default function App() {
                 {EDGE_VOICES.map(v=><option key={v.id} value={v.id}>{v.label}</option>)}
               </select>
             </div>
+          </div>
+
+          {/* Download para offline */}
+          <div style={card({paddingTop:14,paddingBottom:14})}>
+            <div style={row({justifyContent:"space-between",marginBottom:fullyDownloaded?0:8})}>
+              <span style={{fontSize:13,color:C.text,fontWeight:700}}>
+                {fullyDownloaded ? "✅ Livro baixado para ouvir offline" : `⬇️ Modo offline: ${offlinePct}% baixado`}
+              </span>
+              {fullyDownloaded
+                ? <button style={{...btnO,padding:"6px 12px",fontSize:12}} onClick={removeOfflineAudio}>🗑 Remover áudio</button>
+                : <button style={{...btnP(C.acc,C.bg),padding:"6px 14px",fontSize:12}} onClick={downloadForOffline}>Baixar tudo</button>}
+            </div>
+            {!fullyDownloaded && (
+              <div style={{height:5,background:C.s2,borderRadius:99,overflow:"hidden"}}>
+                <div style={{height:"100%",width:offlinePct+"%",background:C.green,borderRadius:99,transition:"width .4s"}}/>
+              </div>
+            )}
           </div>
 
           <div style={{textAlign:"center",fontSize:12,color:C.muted,marginBottom:10,minHeight:16}}>{statusMsg}</div>
