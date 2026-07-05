@@ -248,6 +248,10 @@ export default function App() {
   const playLock = useRef(false);
   // Prefetch queue
   const prefetchQueue = useRef(new Set());
+  // Loop contínuo de pré-carregamento: até onde ele já foi, e um "token" de
+  // geração pra poder invalidar/parar um loop antigo sem precisar de flags soltas.
+  const prefetchTargetRef = useRef(0);
+  const prefetchGenRef = useRef(0);
 
   parasRef.current = paras;
   curRef.current = cur;
@@ -278,30 +282,64 @@ export default function App() {
     navigator.mediaSession.setActionHandler("nexttrack", () => { if(curRef.current<parasRef.current.length-1) playParagraph(curRef.current+1); });
   }, [activeBook]);
 
-  // ── Prefetch helper ──────────────────────────────────────────────────
-  // Antes: só buscava 3 parágrafos à frente, e só quando o atual começava a
-  // tocar — margem pequena demais. Agora busca PREFETCH_AHEAD parágrafos e
-  // faz isso um de cada vez (sequencial), em vez de abrir várias conexões
-  // simultâneas ao servidor da Microsoft (o que aumenta o risco de sermos
-  // limitados/bloqueados, já que o endpoint usado não é oficial).
-  const PREFETCH_AHEAD = 6;
-  const prefetch = useCallback(async (idx, count = PREFETCH_AHEAD) => {
-    const ps = parasRef.current;
-    const end = Math.min(idx + count, ps.length);
-    for (let i = idx; i < end; i++) {
-      const key = `${activeHashRef.current}_${i}_${speedRef.current}`;
-      if (audioCache.current[key] || prefetchQueue.current.has(key)) continue;
-      prefetchQueue.current.add(key);
-      try {
-        const url = await fetchTTS(ps[i], voiceRef.current, speedRef.current);
-        audioCache.current[key] = url;
-        setCachedIdxs(prev => new Set([...prev, i]));
-      } catch {
-        // ignora falha de um parágrafo específico e continua tentando os próximos
-      } finally {
-        prefetchQueue.current.delete(key);
+  // ── Loop contínuo de pré-carregamento ─────────────────────────────────
+  // Diferente da versão anterior (que buscava só N parágrafos e parava), este
+  // loop roda sozinho em segundo plano e não para: ele começa em
+  // prefetchTargetRef.current e vai gerando o áudio, um parágrafo de cada vez,
+  // até chegar ao fim do livro. Enquanto isso, a leitura pode avançar
+  // normalmente — o loop está sempre trabalhando à frente, então na prática
+  // você nunca "alcança" o que ainda não foi gerado.
+  //
+  // Busca um de cada vez (não em paralelo) de propósito: o serviço de voz usado
+  // aqui é um endpoint não-oficial da Microsoft, e abrir várias conexões ao
+  // mesmo tempo aumenta o risco de sermos limitados/bloqueados — o que pioraria
+  // exatamente o problema que estamos resolvendo.
+  const runPrefetchLoop = useCallback(() => {
+    const gen = ++prefetchGenRef.current;
+    (async () => {
+      while (gen === prefetchGenRef.current) {
+        const ps = parasRef.current;
+        const i = prefetchTargetRef.current;
+        if (!ps.length || i >= ps.length) return; // chegou ao fim do livro — pronto
+
+        const key = `${activeHashRef.current}_${i}_${speedRef.current}`;
+
+        if (audioCache.current[key]) {
+          prefetchTargetRef.current = i + 1;
+          continue;
+        }
+        if (prefetchQueue.current.has(key)) {
+          // já está sendo buscado (ex.: playParagraph pediu esse mesmo parágrafo
+          // na hora); só espera um instante e reavalia, sem duplicar a conexão.
+          await new Promise(r => setTimeout(r, 200));
+          continue;
+        }
+
+        prefetchQueue.current.add(key);
+        try {
+          const url = await fetchTTS(ps[i], voiceRef.current, speedRef.current);
+          if (gen !== prefetchGenRef.current) return;
+          audioCache.current[key] = url;
+          setCachedIdxs(prev => new Set([...prev, i]));
+          prefetchTargetRef.current = i + 1;
+        } catch {
+          if (gen !== prefetchGenRef.current) return;
+          // Um parágrafo específico falhou (ex.: instabilidade momentânea de rede).
+          // Espera um pouco e segue para o próximo, em vez de travar o loop inteiro.
+          await new Promise(r => setTimeout(r, 1500));
+          prefetchTargetRef.current = i + 1;
+        } finally {
+          prefetchQueue.current.delete(key);
+        }
       }
-    }
+    })();
+  }, []);
+
+  // Compatibilidade: playParagraph usa isso pra garantir que o loop de fundo
+  // nunca fique "para trás" da posição atual de leitura — se o usuário pular
+  // pra frente, o alvo do loop pula junto (sem reiniciar, sem duplicar buscas).
+  const ensurePrefetchAhead = useCallback((idx) => {
+    if (idx > prefetchTargetRef.current) prefetchTargetRef.current = idx;
   }, []);
 
   // ── Stop all audio completely ────────────────────────────────────────
@@ -392,8 +430,10 @@ export default function App() {
         setLoadingAudio(false);
         setStatusMsg(`▶ Parágrafo ${idx+1} de ${ps.length}`);
         if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
-        // Prefetch next 3 paragraphs while playing
-        prefetch(idx+1);
+        // Garante que o loop de fundo esteja, no mínimo, aqui — ele já deve
+        // estar bem mais à frente na maioria das vezes, isso só protege contra
+        // saltos manuais do usuário.
+        ensurePrefetchAhead(idx+1);
       };
 
       audio.onended = () => {
@@ -420,7 +460,7 @@ export default function App() {
       setLoadingAudio(false); setPlaying(false);
       setStatusMsg("Erro: " + e.message);
     }
-  }, [stopAudio, prefetch]);
+  }, [stopAudio, ensurePrefetchAhead]);
 
   // ── Open book ────────────────────────────────────────────────────────
   const openBook = useCallback(async (book) => {
@@ -446,11 +486,13 @@ export default function App() {
       setActiveBook(book); setView("reader");
       const msg = savedIdx>0 ? `📌 Retomando do parágrafo ${savedIdx+1}` : `${ps.length} parágrafos • Toque ▶ para ouvir`;
       setStatusMsg(msg);
-      // Começa a preparar os áudios ANTES de você apertar play — antes buscava
-      // só 3 parágrafos; agora usa a mesma margem (PREFETCH_AHEAD) do resto do app.
-      setTimeout(() => prefetch(savedIdx), 300);
+      // Começa a gerar o áudio em segundo plano AGORA, a partir de onde você
+      // parou — e não vai parar até chegar ao fim do livro (ou até você trocar
+      // de velocidade/voz, quando reinicia a partir da posição atual).
+      prefetchTargetRef.current = savedIdx;
+      setTimeout(runPrefetchLoop, 300);
     } catch(e) { setErrMsg(e.message); setView("library"); }
-  }, [stopAudio, prefetch]);
+  }, [stopAudio, runPrefetchLoop]);
 
   // ── Add book ─────────────────────────────────────────────────────────
   const addBook = useCallback(async (file) => {
@@ -482,9 +524,10 @@ export default function App() {
       audioCache.current={}; prefetchQueue.current.clear(); setCachedIdxs(new Set());
       setActiveBook(book); setView("reader");
       setStatusMsg(`${ps.length} parágrafos prontos • Toque ▶ para ouvir!`);
-      setTimeout(() => prefetch(0), 300);
+      prefetchTargetRef.current = 0;
+      setTimeout(runPrefetchLoop, 300);
     } catch(e) { setErrMsg(e.message||"Erro ao processar o PDF."); setView("library"); }
-  }, [openBook, stopAudio, prefetch]);
+  }, [openBook, stopAudio, runPrefetchLoop]);
 
   const deleteBook = useCallback(async (hash) => {
     await dbDelete("books", hash); await dbDelete("progress", hash);
@@ -517,6 +560,13 @@ export default function App() {
     setCachedIdxs(new Set());
     speedRef.current = s;
     setSpeed(s);
+    // Sem isso, o loop de fundo continuava marchando pra frente de onde já tinha
+    // chegado antes da troca — os parágrafos entre a posição atual e ali ficavam
+    // com o cache limpo e sem ninguém regerando, até você realmente chegar neles.
+    // Reiniciar o alvo na posição atual + nova geração faz o loop recomeçar dali,
+    // cobrindo de novo (com a nova velocidade) tudo que ainda falta ler.
+    prefetchTargetRef.current = curRef.current;
+    runPrefetchLoop();
     if (playing || loadingAudio) {
       const idx = curRef.current;
       stopAudio();
@@ -530,6 +580,11 @@ export default function App() {
     setCachedIdxs(new Set());
     voiceRef.current = v;
     setVoice(v);
+    // Mesmo motivo do changeSpeed: reinicia o loop de fundo a partir de onde
+    // você está agora, com a nova voz, em vez de deixá-lo continuar de onde
+    // tinha parado (o que deixaria um buraco de parágrafos sem áudio pronto).
+    prefetchTargetRef.current = curRef.current;
+    runPrefetchLoop();
     if (playing || loadingAudio) {
       const idx = curRef.current;
       stopAudio();
